@@ -10,10 +10,12 @@
 # -----------
 # At the end of each split-step (in the x,y,t domain):
 #
-#   A_xyt  +=  noise_sigma * sqrt(deltaZ) * noise_step(t)
+#   Additive (default):  A_xyt  +=  noise_sigma * sqrt(deltaZ) * noise_step(t)
+#   Shot noise:          A_xyt  +=  noise_sigma * sqrt(deltaZ) * sqrt(|A_xyt|) * noise_step(t)
 #
 # with optional spectral colour filter H(omega) and FDT loss balance.
 # Pass eps=None and noise_sigma=0 to recover fully noiseless behaviour.
+# Pass use_shot_noise=True to enable intensity-dependent (shot) noise.
 #
 # Public API — noiseless
 # ----------------------
@@ -24,6 +26,11 @@
 #   windowed_forward         — forward pass broken into windows (noiseless)
 #   windowed_grad            — dL/dA0 via per-window VJP (noiseless)
 #   make_args                — build args dict (+ noise_sigma, noise_filter_w, temporal_abs_t)
+#
+# Public API — boundary helpers
+# ------------------------------
+#   pml_optimal_Wmax          — compute Wmax [1/m] for the spatial CAP from d_pml = pml_thickness·dx
+#   make_temporal_absorber    — build sin² temporal sponge layer (temporal_abs_t array)
 #
 # Public API — noisy / stochastic
 # --------------------------------
@@ -169,26 +176,75 @@ def _prepare_propagation(args, A0, *, precision: str = "fp64"):
     D = ONEJ * (sqrt_term - RD(beta0) - RD(beta1)*OMEGA - RD(0.5)*RD(beta2)*OMEGA**2).astype(CD)
     D_half = jnp.exp(D * RD(deltaZ_linear/2)).astype(CD)
 
-    # PML (disable on singleton axes)
+    # Band-limited angular spectrum filter (Matsushima & Shimobaba 2009).
+    # Zeros transfer-function components whose local signal frequency exceeds the
+    # Nyquist limit of the k-space grid, preventing aliasing that masquerades as
+    # boundary reflections.  For fine steps (ΔZ ≪ Lx) the mask passes all
+    # grid frequencies; it becomes active only for large-step or far-field use.
+    #   kx_limit = k0 · Lx / sqrt(Lx² + ΔZ²)   (and similarly for ky)
+    _k0_ref = float(jnp.max(jnp.abs(beta_eff[Nx//2, Ny//2, :])))  # use max over omega
+    _dZ     = float(deltaZ_linear)
+    _kx_lim = _k0_ref * float(Lx) / float(jnp.sqrt(Lx**2 + _dZ**2))
+    _ky_lim = _k0_ref * float(Ly) / float(jnp.sqrt(Ly**2 + _dZ**2))
+    _BL_mask = (jnp.abs(KX[:, :, 0]) <= RD(_kx_lim)) & (jnp.abs(KY[:, :, 0]) <= RD(_ky_lim))
+    D_half = D_half * _BL_mask[:, :, None].astype(CD)
+
+    # Spatial PML — Complex Absorbing Potential (CAP) applied in real space.
+    #
+    # Profile: sin² ramp — both W and dW/dx vanish at the inner PML edge,
+    # which eliminates the impedance kink that would otherwise cause first-order
+    # reflections.  Applied as exp(-W(x)·ΔZ/2) per half-step (η=0, real sponge).
+    #
+    # Wmax scaling — two physically distinct regimes:
+    #
+    #   SPATIAL absorber (Nx>1 or Ny>1): a diffracted radiation mode moves
+    #   transversely and traverses the full PML depth d_pml in roughly
+    #   d_pml/(kx/kz) z-steps.  The integrated absorption along that path is
+    #   ~Wmax·d_pml/2.  For 40 dB at the worst-case angle (kx/kz ~ 1):
+    #       Wmax = 4.6 / d_pml   where d_pml = pml_thickness · min(dx, dy)
+    #   With η=0 this gives clean absorption without phase artifacts.
+    #
+    #   TEMPORAL absorber (Nx=Ny=1): the soliton tail at temporal coordinate t
+    #   does not move in t; it accumulates W(t)·Lz over all propagation steps.
+    #       Wmax = 4.6 / Lz
+    #   (In practice 1D temporal runs use pml_thickness=0, so this branch
+    #   is rarely reached.)
+    #
+    # η=0 is mandatory: η≠0 adds a spatially varying phase exp(-iη·W·ΔZ) per
+    # step that acts as a diffraction grating and scatters light into high-k
+    # modes, producing square-fringe artifacts.
     pml_thickness = int(args["pml_thickness"])
-    pml_Wmax      = float(args["pml_Wmax"])
+    pml_Wmax_raw  = args.get("pml_Wmax", None)
+    pml_eta       = float(args.get("pml_eta", 0.0))
+    if pml_Wmax_raw is None or float(pml_Wmax_raw) <= 0.0:
+        if pml_thickness > 0 and (Nx > 1 or Ny > 1):
+            # Spatial absorber: calibrate against transverse flight time through PML.
+            d_pml = float(pml_thickness) * float(min(dx, dy))
+            pml_Wmax = 4.6 / d_pml if d_pml > 0.0 else 0.0
+        else:
+            # Temporal / pure-1D case: calibrate against full axial propagation.
+            pml_Wmax = (4.6 / float(Lz)) if float(Lz) > 0.0 else 0.0
+    else:
+        pml_Wmax = float(pml_Wmax_raw)
 
     idx = jnp.arange(Nx); idy = jnp.arange(Ny)
-    d_x = jnp.minimum(idx, (Nx-1)-idx)
-    d_y = jnp.minimum(idy, (Ny-1)-idy)
+    d_x = jnp.minimum(idx, (Nx-1)-idx).astype(RD)
+    d_y = jnp.minimum(idy, (Ny-1)-idy).astype(RD)
 
-    if Nx > 1:
-        ramp_x = jnp.where(d_x < pml_thickness, RD(pml_Wmax)*((RD(pml_thickness)-d_x)/RD(pml_thickness))**2, RD(0))
+    if Nx > 1 and pml_thickness > 0:
+        u_x    = jnp.clip((RD(pml_thickness) - d_x) / RD(pml_thickness), RD(0), RD(1))
+        ramp_x = RD(pml_Wmax) * jnp.sin(RD(np.pi / 2) * u_x) ** 2
     else:
         ramp_x = jnp.zeros(Nx, dtype=RD)
 
-    if Ny > 1:
-        ramp_y = jnp.where(d_y < pml_thickness, RD(pml_Wmax)*((RD(pml_thickness)-d_y)/RD(pml_thickness))**2, RD(0))
+    if Ny > 1 and pml_thickness > 0:
+        u_y    = jnp.clip((RD(pml_thickness) - d_y) / RD(pml_thickness), RD(0), RD(1))
+        ramp_y = RD(pml_Wmax) * jnp.sin(RD(np.pi / 2) * u_y) ** 2
     else:
         ramp_y = jnp.zeros(Ny, dtype=RD)
 
-    W2d = (ramp_x[:,None] + ramp_y[None,:]).astype(RD)
-    PML_half = jnp.exp(-W2d * RD(deltaZ_linear/2)).astype(RD)
+    W2d = (ramp_x[:, None] + ramp_y[None, :]).astype(RD)
+    PML_half = jnp.exp(-(RD(1.0) + ONEJ * RD(pml_eta)) * W2d * RD(deltaZ_linear / 2)).astype(CD)
 
     # Waveguide mode coupling
     Nprop_half = jnp.exp(
@@ -201,7 +257,8 @@ def _prepare_propagation(args, A0, *, precision: str = "fp64"):
     # Gain spectral envelope
     if use_gain:
         omega_fwhm = RD(2) * jnp.pi * RD(gain_fwhm)
-        omega_mid  = omega_fwhm / (RD(2) * jnp.sqrt(jnp.log(RD(2))))
+        # sigma for Gaussian with the given FWHM: sigma = FWHM / (2*sqrt(2*ln2))
+        omega_mid  = omega_fwhm / (RD(2) * jnp.sqrt(RD(2) * jnp.log(RD(2))))
         g0 = RD(gain_coeff)/RD(2)
         gain_term = (g0 * jnp.exp(-(OMEGA**2)/(RD(2)*omega_mid**2))).astype(CD)
         use_gain_flag = True
@@ -292,14 +349,16 @@ def split_step_sharded(field_kwo, *,
 
     # 2) half spatial linear (PML + waveguide)
     field_xyw = jnp.fft.ifftn(field_kwo, axes=(0,1))
-    field_xyw = field_xyw * (PML_half[:, :, None].astype(RD)) * Nprop_half
+    field_xyw = field_xyw * PML_half[:, :, None] * Nprop_half
 
     def _do_nl(field_xyw_local, apply_residual: bool):
         field_xyw_rep = jax.lax.with_sharding_constraint(field_xyw_local, replicate)
         field_xyt = jnp.fft.ifft(field_xyw_rep, axis=2)
 
         def kerr_half(A, dz):
-            return A * jnp.exp(ONEJ * RD(gamma) * RD(0.5) * RD(dz) * jnp.abs(A)**2)
+            # (1-fr) factor: Kerr carries only the instantaneous fraction of gamma;
+            # the Raman fraction fr is handled separately in residual_heun.
+            return A * jnp.exp(ONEJ * RD(gamma) * RD(float(1.0 - fr)) * RD(0.5) * RD(dz) * jnp.abs(A)**2)
 
         def residual_heun(A, dz):
             h = RD(dz) / RD(m_nl_substeps)
@@ -334,7 +393,7 @@ def split_step_sharded(field_kwo, *,
     field_xyw = jax.lax.with_sharding_constraint(field_xyw, shard_t)
 
     # 3) finish spatial linear + back to spectral
-    field_xyw = field_xyw * (PML_half[:, :, None].astype(RD)) * Nprop_half
+    field_xyw = field_xyw * PML_half[:, :, None] * Nprop_half
     field_kwo = jnp.fft.fftn(field_xyw, axes=(0,1))
 
     # 4) finish spectral linear
@@ -1003,7 +1062,7 @@ def _make_args_base(
     beta0_val=None, beta1_val=None, beta2_val=0.0,
     deltaZ=10e-6, deltaZ_NL=None,
     fr=0.0, sw=0,
-    pml_thickness=15, pml_Wmax=1e12,
+    pml_thickness=15, pml_Wmax=None, pml_eta=0.0,
     gain_coeff=0.0, gain_fwhm=0.0,
     saturation_intensity=1e20,
     t1=12.2e-15, t2=32e-15,
@@ -1056,7 +1115,7 @@ def _make_args_base(
         "saturation_intensity": saturation_intensity,
         "gain_coeff": gain_coeff, "gain_fwhm": gain_fwhm,
         "t1": t1, "t2": t2,
-        "pml_thickness": pml_thickness, "pml_Wmax": pml_Wmax,
+        "pml_thickness": pml_thickness, "pml_Wmax": pml_Wmax, "pml_eta": pml_eta,
         "fr": fr, "sw": sw,
         "precision": precision,
     }
@@ -1208,6 +1267,140 @@ def make_noise_samples(key, steps_total: int, Nx: int, Ny: int, Nt: int,
 
 
 # --------------------------------------------------------------------------------------
+# Noise sigma helpers — compute noise_sigma from the initial field
+# --------------------------------------------------------------------------------------
+
+def additive_noise_sigma(A0, sigma_frac: float) -> float:
+    """noise_sigma for additive (ASE) noise: dA = sigma * sqrt(dz) * eps.
+
+    Returns ``sigma_frac * sqrt(I_peak)`` where ``I_peak = max|A0|^2``.
+
+    At the field peak both additive and shot noise give the same noise-to-signal
+    amplitude ratio ``sigma_frac`` per ``sqrt(metre)``, so ``sigma_frac`` has a
+    consistent physical meaning across both noise models.
+
+    Parameters
+    ----------
+    A0         : array-like — initial field (any shape); only the peak is used.
+    sigma_frac : dimensionless fractional noise level (e.g. 0.05 for 5 %).
+
+    Returns
+    -------
+    float — noise_sigma in units [A] / m^(1/2), i.e. sqrt(W/m^2) / m^(1/2).
+    """
+    I_peak = float(np.max(np.abs(np.asarray(A0)) ** 2))
+    return float(sigma_frac) * np.sqrt(I_peak)
+
+
+def shot_noise_sigma(A0, sigma_frac: float) -> float:
+    """noise_sigma for shot noise: dA = sigma * sqrt(|A|) * sqrt(dz) * eps.
+
+    Returns ``sigma_frac * I_peak^(1/4)`` where ``I_peak = max|A0|^2``.
+
+    The sqrt(|A|) factor inside the solver already carries the local intensity
+    dependence — it is zero in the dark cladding and maximal at the field peak.
+    This helper provides the correctly-dimensioned global prefactor so that at
+    the peak, the noise-to-signal amplitude ratio equals ``sigma_frac`` per
+    ``sqrt(metre)`` — the same physical meaning as for additive_noise_sigma.
+
+    Parameters
+    ----------
+    A0         : array-like — initial field (any shape); only the peak is used.
+    sigma_frac : dimensionless fractional noise level (e.g. 0.05 for 5 %).
+
+    Returns
+    -------
+    float — noise_sigma in units [A]^(1/2) / m^(1/2), i.e. W^(1/4) / m.
+    """
+    I_peak = float(np.max(np.abs(np.asarray(A0)) ** 2))
+    return float(sigma_frac) * I_peak ** 0.25
+
+
+# --------------------------------------------------------------------------------------
+# PML and temporal absorber helpers
+# --------------------------------------------------------------------------------------
+
+def pml_optimal_Wmax(d_pml: float, target_db: float = 40.0) -> float:
+    """Return Wmax [1/m] for the spatial CAP absorber in split-step FFT BPM.
+
+    For SPATIAL absorbers (Nx>1 or Ny>1): pass ``d_pml = pml_thickness × dx``.
+    A transverse radiation mode traversing the full PML depth d_pml accumulates
+    ~Wmax·d_pml/2 nepers of absorption (sin² profile, worst-case angle ≈ 45°).
+    Setting this to ``target_db`` dB:
+
+        Wmax = target_db × ln(10) / (20 × d_pml)
+             = 4.6 / d_pml    for target_db = 40 dB
+
+    For purely TEMPORAL / 1D cases (Nx=Ny=1): pass ``Lz`` instead.
+    (In practice, 1D temporal runs use pml_thickness=0, so this is rarely
+    needed.)
+
+    Always use ``pml_eta=0`` (the default).  A non-zero imaginary part
+    creates a spatially varying phase exp(-iη·W·ΔZ) that diffracts light into
+    high-k modes and produces square-fringe artifacts.
+
+    Parameters
+    ----------
+    d_pml     : float — PML physical thickness [m] = pml_thickness × dx for
+                spatial absorbers, or Lz for temporal absorbers.
+    target_db : float — desired attenuation at the outermost PML cell [dB].
+
+    Returns
+    -------
+    float — Wmax [1/m] to pass as ``pml_Wmax`` in ``make_args``.
+    """
+    return float(target_db) * np.log(10.0) / (20.0 * float(d_pml))
+
+
+def make_temporal_absorber(
+    Nt: int,
+    Lt: float,
+    edge_fraction: float = 0.15,
+    Lz: float = None,
+    peak_alpha: float = None,
+) -> np.ndarray:
+    """Build a smooth sin² temporal absorbing boundary (sponge layer).
+
+    Returns a ``(Nt,)`` array of absorption coefficients [1/m] suitable for
+    ``temporal_abs_t`` in :func:`make_args`.  At each z-step the field is
+    multiplied by ``exp(-alpha_t * deltaZ)``, so the total attenuation of a
+    time-bin at position ``t`` is ``exp(-alpha_t(t) * Lz)``.
+
+    The profile is a sin² ramp — both α and dα/dt vanish at the inner edge,
+    which eliminates the impedance kink that causes reflections.
+
+    Parameters
+    ----------
+    Nt            : int — number of time samples.
+    Lt            : float — time-window duration [s] (used only for display; not
+                    needed for the calculation).
+    edge_fraction : float — fraction of ``Nt`` used for each absorbing edge
+                    (default 0.15, i.e. 15% on each side).
+    Lz            : float or None — propagation length [m].  Used to auto-scale
+                    ``peak_alpha`` for ~40 dB absorption if ``peak_alpha`` is None.
+    peak_alpha    : float or None — peak absorption coefficient [1/m] at the
+                    outermost time bin.  If None, auto-computed from ``Lz``.
+
+    Returns
+    -------
+    alpha_t : (Nt,) float64 ndarray  [1/m]
+    """
+    if peak_alpha is None:
+        if Lz is None:
+            raise ValueError("Provide either peak_alpha or Lz for auto-scaling.")
+        peak_alpha = 40.0 * np.log(10.0) / (20.0 * float(Lz))  # 40 dB over Lz
+
+    n_edge = max(2, int(edge_fraction * Nt))
+    u = np.arange(n_edge, dtype=np.float64) / n_edge   # 0 = inner, 1 = outer
+    profile = float(peak_alpha) * np.sin(np.pi / 2.0 * u) ** 2
+
+    alpha_t = np.zeros(Nt, dtype=np.float64)
+    alpha_t[:n_edge]  = profile[::-1]   # left edge: peak at t[0], zero at t[n_edge-1]
+    alpha_t[-n_edge:] = profile         # right edge: zero at t[-n_edge], peak at t[-1]
+    return alpha_t
+
+
+# --------------------------------------------------------------------------------------
 # make_args with noise parameters
 # --------------------------------------------------------------------------------------
 
@@ -1216,6 +1409,7 @@ def make_args(
     noise_sigma: float = 0.0,
     noise_filter_w=None,
     temporal_abs_t=None,
+    shot_noise: bool = False,
     **kwargs,
 ):
     """Extends the base make_args with noise-related parameters.
@@ -1227,11 +1421,14 @@ def make_args(
                      or None (no temporal absorption).  Applied each split-step as
                      A_xyt *= exp(-temporal_abs_t * deltaZ).  Set large values at
                      the temporal edges to create absorbing boundary layers.
+    shot_noise     : bool, default False.  Stored for reference; pass
+                     use_shot_noise=True explicitly to the propagators.
     """
     base = _make_args_base(*args_positional, **kwargs)
     base["noise_sigma"]     = float(noise_sigma)
     base["noise_filter_w"]  = noise_filter_w   # None or jnp array
     base["temporal_abs_t"]  = temporal_abs_t   # None or (Nt,) real array
+    base["shot_noise"]      = bool(shot_noise)  # stored for reference
     return base
 
 
@@ -1240,7 +1437,7 @@ def make_args(
 # --------------------------------------------------------------------------------------
 
 def make_propagate_lean_noisy(shard_t, replicate, *, temporal_abs_mask=None,
-                              loss_coeff=0.0):
+                              loss_coeff=0.0, use_shot_noise: bool = False):
     """Return a JIT-compiled noisy propagator: (field_kwo, eps, sigma, H) -> field_kwo.
 
     Parameters (at call time)
@@ -1268,6 +1465,16 @@ def make_propagate_lean_noisy(shard_t, replicate, *, temporal_abs_mask=None,
         mode is |A|**2_eq = 1 (in field amplitude units), giving a stationary
         noise temperature independent of propagation length.
         Default 0.0 → pure additive ASE noise (no compensating loss).
+    use_shot_noise : bool, default False
+        If True, use intensity-dependent (shot) noise instead of additive noise:
+            A_xyt += noise_sigma * sqrt(deltaZ) * sqrt(|A_xyt|) * noise_step
+        noise_sigma here has units [A]^{1/2}/m^{1/2}, which differs from the
+        additive case ([A]/m^{1/2}).  The caller converts their target noise
+        fraction f into a shot-noise sigma via:
+            sigma_shot = f * I_peak^{1/4}
+        (vs sigma_add = f * I_peak^{1/2} for additive), so that the noise
+        amplitude at |A|^2 = I_peak equals f * sqrt(I_peak) * sqrt(dz)
+        in both cases.  In the dark cladding sqrt(|A|) -> 0 automatically.
 
     Noise model per step (Itô order)
     ---------------------------------
@@ -1275,12 +1482,15 @@ def make_propagate_lean_noisy(shard_t, replicate, *, temporal_abs_mask=None,
         2. A_xyt *= exp(-loss_coeff * deltaZ)        [if loss_coeff > 0]
         3. noise_step = H * FFT(eps_step) -> IFFT    [if use_noise_filter]
                       = eps_step                      [otherwise]
-           A_xyt += noise_sigma * sqrt(deltaZ) * noise_step
+        Additive:  A_xyt += noise_sigma  * sqrt(deltaZ) * noise_step
+        Shot:      A_xyt += noise_sigma' * sqrt(deltaZ) * sqrt(|A_xyt|) * noise_step
+                   (sigma' has units [A]^{1/2}/m^{1/2}; see use_shot_noise docs)
         4. A_xyt *= temporal_abs_mask                [if temporal_abs_mask is not None]
     """
     _use_temporal_abs = temporal_abs_mask is not None
     _use_loss         = float(loss_coeff) > 0.0
     _loss_coeff       = float(loss_coeff)
+    _use_shot_noise   = bool(use_shot_noise)
 
     @partial(
         jax.jit,
@@ -1324,8 +1534,14 @@ def make_propagate_lean_noisy(shard_t, replicate, *, temporal_abs_mask=None,
             _loss_factor = jnp.exp(RD(-_loss_coeff) * RD(deltaZ_linear))
 
         field_kwo0 = jax.lax.with_sharding_constraint(A0_kwo, shard_t)
+        i0 = jnp.array(0, dtype=jnp.int32)
 
-        def one_step(field_kwo, eps_step):
+        def one_step(carry, eps_step):
+            i, field_kwo = carry
+            # Honour skip_nl_every: residual NL (Raman/SS/gain) is applied only
+            # at steps that are multiples of skip_nl_every, matching the noiseless
+            # propagator behaviour.
+            apply_nl = ((i + 1) % jnp.asarray(skip_nl_every, dtype=i.dtype)) == 0
             field_kwo = split_step_sharded(
                 field_kwo,
                 shard_t=shard_t, replicate=replicate,
@@ -1338,7 +1554,7 @@ def make_propagate_lean_noisy(shard_t, replicate, *, temporal_abs_mask=None,
                 use_gain=use_gain,
                 m_nl_substeps=m_nl_substeps,
                 nl_outer_subcycles=nl_outer_subcycles,
-                apply_nl=True,
+                apply_nl=apply_nl,
             )
 
             # ── materialise to xyt domain ──────────────────────────────────
@@ -1364,7 +1580,17 @@ def make_propagate_lean_noisy(shard_t, replicate, *, temporal_abs_mask=None,
                     noise_filter_w[None, None, :].astype(CD) * eps_w, axis=2
                 )
 
-            field_xyt = field_xyt + RD(noise_sigma) * jnp.sqrt(RD(deltaZ_linear)) * eps_cd
+            if _use_shot_noise:
+                # Shot noise: amplitude ∝ sqrt(|A|) — zero in dark regions.
+                # noise_sigma has units [A]^{1/2}/m^{1/2} (differs from additive
+                # [A]/m^{1/2}); the caller scales it for their problem.
+                # Floor |A| at a tiny positive value before sqrt so that the
+                # gradient d(sqrt)/d|A| = 1/(2*sqrt(|A|)) stays finite at zero
+                # (avoids NaN in backward passes through dark-cladding regions).
+                amp = jnp.sqrt(jnp.maximum(jnp.abs(field_xyt), RD(1e-30))).astype(RD)
+                field_xyt = field_xyt + RD(noise_sigma) * jnp.sqrt(RD(deltaZ_linear)) * amp * eps_cd
+            else:
+                field_xyt = field_xyt + RD(noise_sigma) * jnp.sqrt(RD(deltaZ_linear)) * eps_cd
 
             # ── temporal absorbing boundary (optional) ─────────────────────
             # Damps field at temporal edges each step.  temporal_abs_mask is
@@ -1375,11 +1601,11 @@ def make_propagate_lean_noisy(shard_t, replicate, *, temporal_abs_mask=None,
             field_xyw = jnp.fft.fft(field_xyt, axis=2)
             field_kwo = jnp.fft.fftn(field_xyw, axes=(0, 1))
 
-            return field_kwo, None
+            return (i + 1, field_kwo), None
 
         ckpt_step = jax.checkpoint(one_step, prevent_cse=False)
-        field_end_kwo, _ = jax.lax.scan(
-            ckpt_step, field_kwo0, xs=eps, length=int(steps_total)
+        (_, field_end_kwo), _ = jax.lax.scan(
+            ckpt_step, (i0, field_kwo0), xs=eps, length=int(steps_total)
         )
         return field_end_kwo
 
@@ -1405,14 +1631,26 @@ def _resolve_filter(noise_filter_w, Nt, CD):
 # --------------------------------------------------------------------------------------
 
 def make_windowed_context_noisy(args, Nt: int, *, precision: str | None = None,
-                                loss_coeff: float = 0.0):
+                                loss_coeff: float = 0.0, use_shot_noise: bool = False):
     """Like make_windowed_context but returns the noisy lean propagator."""
     prec = precision or args.get("precision", "fp64")
+    RD, CD, _ = _resolve_precision(prec)
     prep = _prepare_propagation(args, np.zeros((1, 1, Nt)), precision=prec)
     _, shard_t, replicate = _make_mesh_for_time_axis(Nt)
 
+    # Build temporal absorption mask so windowed_forward_noisy / windowed_grad_noisy
+    # honour args["temporal_abs_t"] exactly as GNLSE3D_propagate_noisy does.
+    _tab = args.get("temporal_abs_t", None)
+    if _tab is not None:
+        _dz   = float(prep["deltaZ_linear"])
+        _mask = jnp.exp(-jnp.asarray(_tab, dtype=RD)[None, None, :] * RD(_dz))
+    else:
+        _mask = None
+
     prop_lean_noisy = make_propagate_lean_noisy(shard_t, replicate,
-                                                loss_coeff=loss_coeff)
+                                                temporal_abs_mask=_mask,
+                                                loss_coeff=loss_coeff,
+                                                use_shot_noise=use_shot_noise)
     lean_kw = _build_lean_kw(prep, args)
 
     return dict(
@@ -1436,6 +1674,7 @@ def GNLSE3D_propagate_noisy(
     *,
     loss_coeff: float = 0.0,
     noise_filter_w=None,
+    use_shot_noise: bool = False,
     precision: str | None = None,
     save_as_fp32: bool = True,
 ):
@@ -1470,14 +1709,21 @@ def GNLSE3D_propagate_noisy(
 
     steps_total = prep["steps_total"]
 
-    if eps is None or float(noise_sigma) == 0.0:
-        eps_jnp     = jnp.zeros((steps_total, Nx, Ny, Nt), dtype=CD)
+    _noiseless = (eps is None or float(noise_sigma) == 0.0)
+    if _noiseless:
+        eps_jnp     = None   # Lazy zeros per window — avoids (steps_total,Nx,Ny,Nt) allocation
         noise_sigma = 0.0
     else:
         eps_jnp = jnp.asarray(eps, dtype=CD)
         assert eps_jnp.shape == (steps_total, Nx, Ny, Nt), (
             f"eps must have shape ({steps_total}, {Nx}, {Ny}, {Nt}), got {eps_jnp.shape}"
         )
+
+    def _eps_slice(start, stop):
+        n = stop - start
+        if eps_jnp is not None:
+            return eps_jnp[start:stop]
+        return jnp.zeros((n, Nx, Ny, Nt), dtype=CD)
 
     filter_arr, use_filter = _resolve_filter(noise_filter_w, Nt, CD)
 
@@ -1490,7 +1736,8 @@ def GNLSE3D_propagate_noisy(
         _mask = None
     prop_noisy = make_propagate_lean_noisy(shard_t, replicate,
                                            temporal_abs_mask=_mask,
-                                           loss_coeff=loss_coeff)
+                                           loss_coeff=loss_coeff,
+                                           use_shot_noise=use_shot_noise)
     lean_kw    = _build_lean_kw(prep, args)
 
     save_idx = np.asarray(prep["save_idx"])
@@ -1506,9 +1753,8 @@ def GNLSE3D_propagate_noisy(
         target_done   = int(save_idx[si]) + 1
         n_steps_here  = target_done - steps_done
         if n_steps_here > 0:
-            eps_slice = eps_jnp[steps_done:target_done]
             field_kwo = prop_noisy(
-                field_kwo, eps_slice, noise_sigma, filter_arr,
+                field_kwo, _eps_slice(steps_done, target_done), noise_sigma, filter_arr,
                 use_noise_filter=use_filter, **lean_kw, steps_total=n_steps_here,
             )
         snap = _materialize_xyt(field_kwo, replicate).astype(CD_save)
@@ -1517,9 +1763,8 @@ def GNLSE3D_propagate_noisy(
 
     remaining = steps_total - steps_done
     if remaining > 0:
-        eps_slice = eps_jnp[steps_done:]
         field_kwo = prop_noisy(
-            field_kwo, eps_slice, noise_sigma, filter_arr,
+            field_kwo, _eps_slice(steps_done, steps_total), noise_sigma, filter_arr,
             use_noise_filter=use_filter, **lean_kw, steps_total=remaining,
         )
 
@@ -1543,8 +1788,10 @@ def windowed_forward_noisy(
     eps,
     noise_sigma: float = 0.0,
     *,
+    eps_key=None,
     loss_coeff: float = 0.0,
     noise_filter_w=None,
+    use_shot_noise: bool = False,
     n_windows: int = 10,
     precision: str | None = None,
     save_as_fp32: bool = True,
@@ -1555,6 +1802,13 @@ def windowed_forward_noisy(
     Parameters
     ----------
     eps            : (steps_total, Nx, Ny, Nt) or None
+        Pre-sampled noise array.  Required for gradient-based optimisation through
+        noise (reparameterization trick).  Loads the full array onto the GPU — memory
+        scales with steps_total.
+    eps_key        : jax.random.PRNGKey or None
+        Alternative to eps for forward-only runs.  Noise is generated one window at
+        a time (O(steps_per_window * Nx * Ny * Nt) peak GPU memory, independent of
+        steps_total).  Mutually exclusive with eps; eps_key takes priority.
     noise_sigma    : float, differentiable noise amplitude
     noise_filter_w : (Nt,) array or None — colour filter from make_noise_filter()
 
@@ -1569,7 +1823,8 @@ def windowed_forward_noisy(
 
     if ctx is None:
         ctx = make_windowed_context_noisy(args, Nt, precision=prec,
-                                          loss_coeff=loss_coeff)
+                                          loss_coeff=loss_coeff,
+                                          use_shot_noise=use_shot_noise)
 
     prop_lean = ctx["prop_lean"]
     lean_kw   = ctx["lean_kw"]
@@ -1579,11 +1834,25 @@ def windowed_forward_noisy(
     steps_total  = prep["steps_total"]
     window_steps = _uniform_window_steps(steps_total, n_windows)
 
-    if eps is None or float(noise_sigma) == 0.0:
-        eps_jnp     = jnp.zeros((steps_total, Nx, Ny, Nt), dtype=CD)
+    _do_noise = float(noise_sigma) != 0.0
+    if not _do_noise:
+        eps_jnp  = None
+        _use_key = False
         noise_sigma = 0.0
+    elif eps_key is not None:
+        # Key-based: generate one window's noise at a time — O(steps_per_window*Nx*Ny*Nt)
+        # peak GPU memory, independent of steps_total.
+        eps_jnp  = None
+        _use_key = True
+        _base_key = eps_key
+    elif eps is not None:
+        # Legacy: full pre-sampled array (required for windowed_grad_noisy / reparam trick)
+        eps_jnp  = jnp.asarray(eps, dtype=CD)
+        _use_key = False
     else:
-        eps_jnp = jnp.asarray(eps, dtype=CD)
+        eps_jnp  = None
+        _use_key = False
+        noise_sigma = 0.0
 
     filter_arr, use_filter = _resolve_filter(noise_filter_w, Nt, CD)
 
@@ -1597,7 +1866,13 @@ def windowed_forward_noisy(
         if nw == 0:
             checkpoints_host.append(checkpoints_host[-1].copy())
             continue
-        eps_w = eps_jnp[step_start:step_start + nw]
+        if _use_key:
+            eps_w = make_noise_samples(jax.random.fold_in(_base_key, w),
+                                       nw, Nx, Ny, Nt, dtype=CD)
+        elif eps_jnp is not None:
+            eps_w = eps_jnp[step_start:step_start + nw]
+        else:
+            eps_w = jnp.zeros((nw, Nx, Ny, Nt), dtype=CD)
         field_kwo = prop_lean(
             field_kwo, eps_w, noise_sigma, filter_arr,
             use_noise_filter=use_filter, **lean_kw, steps_total=nw,
@@ -1629,6 +1904,7 @@ def windowed_grad_noisy(
     *,
     loss_coeff: float = 0.0,
     noise_filter_w=None,
+    use_shot_noise: bool = False,
     n_windows: int = 10,
     precision: str | None = None,
     ctx: dict | None = None,
@@ -1653,7 +1929,8 @@ def windowed_grad_noisy(
 
     if ctx is None:
         ctx = make_windowed_context_noisy(args, Nt, precision=prec,
-                                          loss_coeff=loss_coeff)
+                                          loss_coeff=loss_coeff,
+                                          use_shot_noise=use_shot_noise)
 
     prop_lean = ctx["prop_lean"]
     lean_kw   = ctx["lean_kw"]
@@ -1663,19 +1940,22 @@ def windowed_grad_noisy(
     window_steps = _uniform_window_steps(steps_total, n_windows)
 
     if eps is None or float(noise_sigma) == 0.0:
-        eps_jnp     = jnp.zeros((steps_total, Nx, Ny, Nt), dtype=CD)
+        eps_jnp     = None
         noise_sigma = 0.0
     else:
         eps_jnp = jnp.asarray(eps, dtype=CD)
 
     filter_arr, use_filter = _resolve_filter(noise_filter_w, Nt, CD)
 
-    # Slice eps per window and cache on host
+    # Slice eps per window and cache on host (None sentinel when noiseless)
     step_start = 0
     eps_slices_host = []
     for w in range(n_windows):
         nw = window_steps[w]
-        eps_slices_host.append(np.asarray(eps_jnp[step_start:step_start + nw]))
+        if eps_jnp is not None:
+            eps_slices_host.append(np.asarray(eps_jnp[step_start:step_start + nw]))
+        else:
+            eps_slices_host.append(None)
         step_start += nw
 
     # ── Forward pass: store checkpoints on host ───────────────────────────
@@ -1688,7 +1968,8 @@ def windowed_grad_noisy(
         if nw == 0:
             checkpoints_host.append(checkpoints_host[-1].copy())
             continue
-        eps_w = jnp.asarray(eps_slices_host[w])
+        eps_w = (jnp.asarray(eps_slices_host[w]) if eps_slices_host[w] is not None
+                 else jnp.zeros((nw, Nx, Ny, Nt), dtype=CD))
         field_kwo = prop_lean(
             field_kwo, eps_w, noise_sigma, filter_arr,
             use_noise_filter=use_filter, **lean_kw, steps_total=nw,
@@ -1711,7 +1992,8 @@ def windowed_grad_noisy(
         if nw == 0:
             continue
         A_start = jnp.asarray(checkpoints_host[w])
-        eps_w   = jnp.asarray(eps_slices_host[w])
+        eps_w   = (jnp.asarray(eps_slices_host[w]) if eps_slices_host[w] is not None
+                   else jnp.zeros((nw, Nx, Ny, Nt), dtype=CD))
 
         def _wp(a_start, _eps=eps_w, _nw=nw):
             return prop_lean(
