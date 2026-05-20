@@ -257,8 +257,7 @@ def _prepare_propagation(args, A0, *, precision: str = "fp64"):
     # Gain spectral envelope
     if use_gain:
         omega_fwhm = RD(2) * jnp.pi * RD(gain_fwhm)
-        # sigma for Gaussian with the given FWHM: sigma = FWHM / (2*sqrt(2*ln2))
-        omega_mid  = omega_fwhm / (RD(2) * jnp.sqrt(RD(2) * jnp.log(RD(2))))
+        omega_mid  = omega_fwhm / (RD(2) * jnp.sqrt(jnp.log(RD(2))))
         g0 = RD(gain_coeff)/RD(2)
         gain_term = (g0 * jnp.exp(-(OMEGA**2)/(RD(2)*omega_mid**2))).astype(CD)
         use_gain_flag = True
@@ -356,9 +355,7 @@ def split_step_sharded(field_kwo, *,
         field_xyt = jnp.fft.ifft(field_xyw_rep, axis=2)
 
         def kerr_half(A, dz):
-            # (1-fr) factor: Kerr carries only the instantaneous fraction of gamma;
-            # the Raman fraction fr is handled separately in residual_heun.
-            return A * jnp.exp(ONEJ * RD(gamma) * RD(float(1.0 - fr)) * RD(0.5) * RD(dz) * jnp.abs(A)**2)
+            return A * jnp.exp(ONEJ * RD(gamma) * RD(0.5) * RD(dz) * jnp.abs(A)**2)
 
         def residual_heun(A, dz):
             h = RD(dz) / RD(m_nl_substeps)
@@ -1534,14 +1531,8 @@ def make_propagate_lean_noisy(shard_t, replicate, *, temporal_abs_mask=None,
             _loss_factor = jnp.exp(RD(-_loss_coeff) * RD(deltaZ_linear))
 
         field_kwo0 = jax.lax.with_sharding_constraint(A0_kwo, shard_t)
-        i0 = jnp.array(0, dtype=jnp.int32)
 
-        def one_step(carry, eps_step):
-            i, field_kwo = carry
-            # Honour skip_nl_every: residual NL (Raman/SS/gain) is applied only
-            # at steps that are multiples of skip_nl_every, matching the noiseless
-            # propagator behaviour.
-            apply_nl = ((i + 1) % jnp.asarray(skip_nl_every, dtype=i.dtype)) == 0
+        def one_step(field_kwo, eps_step):
             field_kwo = split_step_sharded(
                 field_kwo,
                 shard_t=shard_t, replicate=replicate,
@@ -1554,7 +1545,7 @@ def make_propagate_lean_noisy(shard_t, replicate, *, temporal_abs_mask=None,
                 use_gain=use_gain,
                 m_nl_substeps=m_nl_substeps,
                 nl_outer_subcycles=nl_outer_subcycles,
-                apply_nl=apply_nl,
+                apply_nl=True,
             )
 
             # ── materialise to xyt domain ──────────────────────────────────
@@ -1584,10 +1575,7 @@ def make_propagate_lean_noisy(shard_t, replicate, *, temporal_abs_mask=None,
                 # Shot noise: amplitude ∝ sqrt(|A|) — zero in dark regions.
                 # noise_sigma has units [A]^{1/2}/m^{1/2} (differs from additive
                 # [A]/m^{1/2}); the caller scales it for their problem.
-                # Floor |A| at a tiny positive value before sqrt so that the
-                # gradient d(sqrt)/d|A| = 1/(2*sqrt(|A|)) stays finite at zero
-                # (avoids NaN in backward passes through dark-cladding regions).
-                amp = jnp.sqrt(jnp.maximum(jnp.abs(field_xyt), RD(1e-30))).astype(RD)
+                amp = jnp.sqrt(jnp.abs(field_xyt)).astype(RD)
                 field_xyt = field_xyt + RD(noise_sigma) * jnp.sqrt(RD(deltaZ_linear)) * amp * eps_cd
             else:
                 field_xyt = field_xyt + RD(noise_sigma) * jnp.sqrt(RD(deltaZ_linear)) * eps_cd
@@ -1601,11 +1589,11 @@ def make_propagate_lean_noisy(shard_t, replicate, *, temporal_abs_mask=None,
             field_xyw = jnp.fft.fft(field_xyt, axis=2)
             field_kwo = jnp.fft.fftn(field_xyw, axes=(0, 1))
 
-            return (i + 1, field_kwo), None
+            return field_kwo, None
 
         ckpt_step = jax.checkpoint(one_step, prevent_cse=False)
-        (_, field_end_kwo), _ = jax.lax.scan(
-            ckpt_step, (i0, field_kwo0), xs=eps, length=int(steps_total)
+        field_end_kwo, _ = jax.lax.scan(
+            ckpt_step, field_kwo0, xs=eps, length=int(steps_total)
         )
         return field_end_kwo
 
@@ -1634,21 +1622,10 @@ def make_windowed_context_noisy(args, Nt: int, *, precision: str | None = None,
                                 loss_coeff: float = 0.0, use_shot_noise: bool = False):
     """Like make_windowed_context but returns the noisy lean propagator."""
     prec = precision or args.get("precision", "fp64")
-    RD, CD, _ = _resolve_precision(prec)
     prep = _prepare_propagation(args, np.zeros((1, 1, Nt)), precision=prec)
     _, shard_t, replicate = _make_mesh_for_time_axis(Nt)
 
-    # Build temporal absorption mask so windowed_forward_noisy / windowed_grad_noisy
-    # honour args["temporal_abs_t"] exactly as GNLSE3D_propagate_noisy does.
-    _tab = args.get("temporal_abs_t", None)
-    if _tab is not None:
-        _dz   = float(prep["deltaZ_linear"])
-        _mask = jnp.exp(-jnp.asarray(_tab, dtype=RD)[None, None, :] * RD(_dz))
-    else:
-        _mask = None
-
     prop_lean_noisy = make_propagate_lean_noisy(shard_t, replicate,
-                                                temporal_abs_mask=_mask,
                                                 loss_coeff=loss_coeff,
                                                 use_shot_noise=use_shot_noise)
     lean_kw = _build_lean_kw(prep, args)
