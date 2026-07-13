@@ -6,6 +6,9 @@
 #   - Mode plotting functions for 2D, 1D, and gallery views
 # ======================================================================================
 
+from __future__ import annotations  # lazy annotations: 'str | plt.Colormap' etc.
+                                     # are never evaluated at import time.
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
@@ -38,7 +41,8 @@ def make_xy_t_animation(field4d,
                         stride=1,                  # take every 'stride' frame in the selected window
                         fps=30,
                         filename='xy_t.gif',
-                        dpi=120):
+                        dpi=120,
+                        phase_mask_threshold=0.05):  # fraction of peak amplitude below which phase is masked
     """
     Animate the transverse (x,y) field vs time at a fixed z, optionally over a narrower time range.
 
@@ -100,7 +104,9 @@ def make_xy_t_animation(field4d,
         data_t = np.imag(F)
         cbar_label = 'Im{E}'
     elif quantity == 'phase':
-        data_t = np.angle(F)
+        _amp_t = np.abs(F)
+        _thresh_t = phase_mask_threshold * float(_amp_t.max()) if phase_mask_threshold > 0 else 0.0
+        data_t = np.where(_amp_t >= _thresh_t, np.angle(F), np.nan)
         cbar_label = 'arg(E)'
     else:
         raise ValueError("quantity must be one of: 'intensity', 'abs', 'real', 'imag', 'phase'")
@@ -154,9 +160,19 @@ def make_xy_t_animation(field4d,
     else:
         raise ValueError("norm must be 'global' or 'per_frame'")
 
+    # Phase uses fixed ±π range and a masked hsv colormap
+    if quantity == 'phase':
+        _phase_cmap = plt.cm.hsv.copy()
+        _phase_cmap.set_bad('lightgray')
+        use_cmap = _phase_cmap
+        vmin, vmax = -np.pi, np.pi
+    else:
+        use_cmap = None
+
     # Prepare figure
     fig, ax = plt.subplots()
-    im = ax.imshow(data_sel[..., 0].T, origin='lower', extent=extent, vmin=vmin, vmax=vmax)
+    im = ax.imshow(data_sel[..., 0].T, origin='lower', extent=extent,
+                   vmin=vmin, vmax=vmax, cmap=use_cmap)
     ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
     if t_sel is not None:
         title = ax.set_title(f"z index = {z_index}, t = {t_sel[0]}")
@@ -170,7 +186,7 @@ def make_xy_t_animation(field4d,
     # Frame update
     def update(k):
         frame_data = data_sel[..., k]
-        if norm == 'per_frame':
+        if norm == 'per_frame' and quantity != 'phase':
             im.set_clim(np.nanmin(frame_data), np.nanmax(frame_data))
         im.set_data(frame_data.T)
         if t_sel is not None:
@@ -258,7 +274,8 @@ def make_xy_z_animation(field4d,
                         stride=1,                  # take every 'stride' frame in the selected window
                         fps=30,
                         filename='xy_z.gif',
-                        dpi=120):
+                        dpi=120,
+                        phase_mask_threshold=0.05):  # fraction of peak amplitude below which phase is masked
     """
     Animate the transverse (x,y) field vs propagation distance z at a fixed time index t.
 
@@ -320,7 +337,9 @@ def make_xy_z_animation(field4d,
         data_z = np.imag(F)
         cbar_label = 'Im{E}'
     elif quantity == 'phase':
-        data_z = np.angle(F)
+        _amp_z = np.abs(F)
+        _thresh_z = phase_mask_threshold * float(_amp_z.max()) if phase_mask_threshold > 0 else 0.0
+        data_z = np.where(_amp_z >= _thresh_z, np.angle(F), np.nan)
         cbar_label = 'arg(E)'
     else:
         raise ValueError("quantity must be one of: 'intensity', 'abs', 'real', 'imag', 'phase'")
@@ -373,9 +392,19 @@ def make_xy_z_animation(field4d,
     else:
         raise ValueError("norm must be 'global' or 'per_frame'")
 
+    # Phase uses fixed ±π range and a masked hsv colormap
+    if quantity == 'phase':
+        _phase_cmap = plt.cm.hsv.copy()
+        _phase_cmap.set_bad('lightgray')
+        use_cmap = _phase_cmap
+        vmin, vmax = -np.pi, np.pi
+    else:
+        use_cmap = None
+
     # Prepare figure
     fig, ax = plt.subplots()
-    im = ax.imshow(data_sel[..., 0].T, origin='lower', extent=extent, vmin=vmin, vmax=vmax)
+    im = ax.imshow(data_sel[..., 0].T, origin='lower', extent=extent,
+                   vmin=vmin, vmax=vmax, cmap=use_cmap)
     ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
     if z_sel is not None:
         title = ax.set_title(f"t index = {t_index}, z = {z_sel[0]}")
@@ -389,7 +418,7 @@ def make_xy_z_animation(field4d,
     # Frame update
     def update(k):
         frame_data = data_sel[..., k]
-        if norm == 'per_frame':
+        if norm == 'per_frame' and quantity != 'phase':
             im.set_clim(np.nanmin(frame_data), np.nanmax(frame_data))
         im.set_data(frame_data.T)
         if z_sel is not None:
@@ -739,7 +768,8 @@ def plot_mode_2d(mode_data,
                  figsize=(6, 5),
                  title=None,
                  show_colorbar=True,
-                 ax=None):
+                 ax=None,
+                 phase_mask_threshold=0.05):  # fraction of peak amplitude below which phase is masked
     """
     Plot a 2D mode profile.
 
@@ -795,10 +825,21 @@ def plot_mode_2d(mode_data,
         data = np.imag(field)
         cbar_label = r'Im$\{E\}$'
     elif quantity == 'phase':
-        data = np.angle(field)
+        _amp_m = np.abs(field)
+        _thresh_m = phase_mask_threshold * float(_amp_m.max()) if phase_mask_threshold > 0 else 0.0
+        data = np.where(_amp_m >= _thresh_m, np.angle(field), np.nan)
         cbar_label = r'arg$(E)$'
     else:
         raise ValueError("quantity must be 'intensity', 'abs', 'real', 'imag', or 'phase'")
+
+    # For phase: override colormap and fix ±π range
+    if quantity == 'phase':
+        _phase_cmap = plt.cm.hsv.copy()
+        _phase_cmap.set_bad('lightgray')
+        cmap = _phase_cmap
+        vmin_im, vmax_im = -np.pi, np.pi
+    else:
+        vmin_im, vmax_im = None, None
 
     # Create figure if needed
     if ax is None:
@@ -814,7 +855,8 @@ def plot_mode_2d(mode_data,
     else:
         extent = None
 
-    im = ax.imshow(data.T, origin='lower', cmap=cmap, extent=extent, aspect='auto')
+    im = ax.imshow(data.T, origin='lower', cmap=cmap, extent=extent, aspect='auto',
+                   vmin=vmin_im, vmax=vmax_im)
 
     if show_colorbar:
         cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -839,6 +881,7 @@ def plot_mode_1d(mode_data,
                  title=None,
                  ax=None,
                  label=None,
+                 phase_mask_threshold=0.05,  # fraction of peak amplitude below which phase is masked
                  **plot_kwargs):
     """
     Plot a 1D mode profile (for Nx=1 or Ny=1 cases).
@@ -900,7 +943,9 @@ def plot_mode_1d(mode_data,
         data = np.imag(field_1d)
         ylabel = r'Im$\{E\}$'
     elif quantity == 'phase':
-        data = np.angle(field_1d)
+        _amp_1d = np.abs(field_1d)
+        _thresh_1d = phase_mask_threshold * float(_amp_1d.max()) if phase_mask_threshold > 0 else 0.0
+        data = np.where(_amp_1d >= _thresh_1d, np.angle(field_1d), np.nan)
         ylabel = r'arg$(E)$'
     else:
         raise ValueError("quantity must be 'intensity', 'abs', 'real', 'imag', or 'phase'")
@@ -1144,7 +1189,8 @@ def make_1d_z_animation(field4d,
                         filename='1d_z.gif',
                         figsize=(8, 4),
                         ylim=None,
-                        dpi=120):
+                        dpi=120,
+                        phase_mask_threshold=0.05):  # fraction of peak amplitude below which phase is masked
     """
     Animate a 1D intensity profile (along x, y, or t) stepping through z frames.
 
@@ -1230,7 +1276,7 @@ def make_1d_z_animation(field4d,
         compute = lambda F: np.imag(F)
         ylabel = r'Im$\{E\}$'
     elif quantity == 'phase':
-        compute = lambda F: np.angle(F)
+        compute = None  # handled explicitly in data-building loop below
         ylabel = r'arg$(E)$'
     else:
         raise ValueError("quantity must be 'intensity', 'abs', 'real', 'imag', or 'phase'")
@@ -1256,9 +1302,15 @@ def make_1d_z_animation(field4d,
 
     # Build data matrix: (N_coord, N_frames)
     N_coord = {'x': Nx, 'y': Ny, 't': Nt}[coord_axis]
-    data_all = np.zeros((N_coord, frame_indices.size))
+    data_all = np.full((N_coord, frame_indices.size), np.nan)
     for k, iz in enumerate(frame_indices):
-        data_all[:, k] = _extract_1d(compute(field4d[..., iz]))
+        if quantity == 'phase':
+            raw_1d = _extract_1d(field4d[..., iz])
+            amp_1d = np.abs(raw_1d)
+            thresh = phase_mask_threshold * float(amp_1d.max()) if phase_mask_threshold > 0 else 0.0
+            data_all[:, k] = np.where(amp_1d >= thresh, np.angle(raw_1d), np.nan)
+        else:
+            data_all[:, k] = _extract_1d(compute(field4d[..., iz]))
 
     z_sel = z[frame_indices] if z is not None else None
     Nf = frame_indices.size
