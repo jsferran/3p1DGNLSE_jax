@@ -161,11 +161,18 @@ optimization built on this solver:
 
 ## 6. Boundaries (three independent systems)
 
-- **Spatial PML/CAP** (x,y edges): sin² real absorber, `exp(−W dz/2)` per
-  half-step. Wmax auto-calibrated from the PML *depth* (40 dB across d_pml),
-  not the propagation length. `pml_eta = 0` is mandatory (a complex CAP phase
-  diffracts high-k ghosts). Verified: a guided LP01 loses only 0.84% over
-  35 cm / 15k steps (uniform discretization shedding, not PML erosion).
+- **Spatial absorbing boundary layer** (x,y edges): a sin² *sponge* — a real
+  absorbing potential `exp(−W dz/2)` per half-step.  Terminology note: the
+  `pml_*` argument names are historical; this is NOT a Perfectly Matched Layer
+  (no complex coordinate stretching, no reflectionless matching).  It avoids
+  reflections *adiabatically* — W and dW/dx vanish at the inner edge, and the
+  ramp is long compared to 1/k⊥ — which is why it must be tens of pixels thick,
+  and why it is strong exactly where we need it (high-k collapse debris) and
+  weakest for near-grazing (small-k⊥) radiation.  Wmax is auto-calibrated from
+  the layer *depth* (40 dB across d_pml), not the propagation length.
+  `pml_eta = 0` is mandatory (an inconsistent absorber phase acts as a grating
+  and diffracts high-k ghosts).  Verified: a guided LP01 loses only 0.84% over
+  35 cm / 15k steps (uniform discretization shedding, not boundary erosion).
 - **Temporal absorber** (t edges): sin² sponge `exp(−α(t) dz)`, for pulses that
   broaden toward the window edge; honoured on **all** propagator paths.
 - **Band-limit mask**: automatic anti-aliasing of the transfer function.
