@@ -40,7 +40,7 @@ Key operator details:
 - A **band-limit mask** (Matsushima) zeroes k-components that would alias for
   the given dz; a no-op for our fine steps.
 
-## 2. Units and conventions (the ones that bite)
+## 2. Units and conventions
 
 - **|A|² is intensity [W/m²]**, not power. γ = n₂ω₀/c₀ [m/W] is the *bulk*
   coefficient. For 1+1D temporal runs you must convert power → intensity with an
